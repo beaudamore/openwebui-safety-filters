@@ -1,0 +1,39 @@
+version: "3.8"
+
+services:
+  clamav:
+    image: clamav/clamav:latest
+    platform: linux/amd64 # Force x86 emulation for ARM compatibility
+    container_name: clamav
+    restart: unless-stopped
+    ports:
+      - "3310:3310"
+    volumes:
+      - clamav-db:/var/lib/clamav
+      - clamav-logs:/var/log/clamav
+    environment:
+      # Database update settings
+      - CLAMAV_NO_FRESHCLAM=false
+      # Scan settings
+      - CLAMD_CONF_MaxScanSize=500M
+      - CLAMD_CONF_MaxFileSize=100M
+      - CLAMD_CONF_StreamMaxLength=100M
+      - CLAMD_CONF_MaxThreads=4
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/clamdcheck.sh"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 300s
+    networks:
+      - filters-network
+
+volumes:
+  clamav-db:
+    driver: local
+  clamav-logs:
+    driver: local
+
+networks:
+  filters-network:
+    driver: bridge
