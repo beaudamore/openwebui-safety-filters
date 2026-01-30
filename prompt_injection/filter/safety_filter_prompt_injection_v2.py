@@ -2,6 +2,7 @@
 Prompt Injection Protection Filter for Open WebUI
 Filters user inputs for prompt injection attempts using a dedicated detection model.
 version 2.0.0
+requirements: pydantic
 """
 
 from typing import Optional, Callable, Awaitable, List, Any
