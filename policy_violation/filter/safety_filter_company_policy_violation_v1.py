@@ -2,6 +2,8 @@
 Policy Violation Filter for Open WebUI
 Filters user inputs and model outputs for potential company policy violations using local Open WebUI libraries (internal chat + vector DB) with optional policy augmentation.
 All remote HTTP API usage removed; only explicit policy violation detection remains.
+version 1.0.0
+requirements: pydantic
 """
 
 from typing import Optional, Callable, Awaitable, List, Any
