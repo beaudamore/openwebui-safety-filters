@@ -1,5 +1,11 @@
 # Open WebUI Safety Filters
 
+![Python](https://img.shields.io/badge/Python-3.10+-blue?logo=python&logoColor=white)
+![OpenWebUI](https://img.shields.io/badge/Open_WebUI-Filter-green?logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyNCIgaGVpZ2h0PSIyNCIgdmlld0JveD0iMCAwIDI0IDI0IiBmaWxsPSJ3aGl0ZSI+PHBhdGggZD0iTTEyIDJDNi40OCAyIDIgNi40OCAyIDEyczQuNDggMTAgMTAgMTAgMTAtNC40OCAxMC0xMFMxNy41MiAyIDEyIDJ6Ii8+PC9zdmc+)
+![ClamAV](https://img.shields.io/badge/ClamAV-Antivirus-red?logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyNCIgaGVpZ2h0PSIyNCIgdmlld0JveD0iMCAwIDI0IDI0IiBmaWxsPSJ3aGl0ZSI+PHBhdGggZD0iTTEyIDJDNi40OCAyIDIgNi40OCAyIDEyczQuNDggMTAgMTAgMTAgMTAtNC40OCAxMC0xMFMxNy41MiAyIDEyIDJ6Ii8+PC9zdmc+)
+![License](https://img.shields.io/badge/License-MIT-yellow)
+![Enterprise](https://img.shields.io/badge/Enterprise-Ready-purple)
+
 A comprehensive collection of content filtering and safety modules for Open WebUI. These filters provide protection against malware, harmful content, policy violations, and prompt injection attacks.
 
 ## Author
@@ -13,29 +19,29 @@ This repository contains multiple safety filter implementations designed to prot
 
 ### Available Filters
 
-1. **Antivirus/Antimalware Filter** (`safety_filter_antivirus_antimalware.py`)
+1. **Antivirus/Antimalware Filter** (`antivirus/filter/safety_filter_antivirus_antimalware.py`)
    - Scans file uploads with ClamAV for viruses and malware
    - Integrates with ClamAV daemon for real-time threat detection
    - Automatically blocks infected files and logs violations
 
-2. **Content Safety Filter** (`safety/api/safety_filter_api.py`)
+2. **Content Safety Filter** (`content_safety/filter/`)
    - Filters user inputs and model outputs for harmful content
    - Uses external safety API for content classification
    - Detects: Dangerous Content, Hate Speech, Harassment, Sexually Explicit material
 
-3. **Enhanced Safety Filter** (`safety_filter_guard_v1.py`)
+3. **Enhanced Safety Filter** (`content_safety/filter/safety_filter_guard_v1.py`)
    - Advanced safety filtering with policy augmentation
    - Integrates with Open WebUI's internal chat completion system
    - Supports optional policy augmentation via direct API calls
    - Includes comprehensive logging and debugging capabilities
 
-4. **Policy Violation Filter** (`safety_filter_company_policy_violation_v1.py`)
+4. **Policy Violation Filter** (`policy_violation/filter/safety_filter_company_policy_violation_v1.py`)
    - Detects potential company policy violations in user input and model output
    - Uses Open WebUI's internal chat system and vector database
    - Customizable policy rules and violation detection thresholds
    - Tracks violation history per user
 
-5. **Prompt Injection Filters** (Multiple versions: v1, v1.1, v2)
+5. **Prompt Injection Filters** (`prompt_injection/filter/` — versions: v1, v1.1, v2)
    - Detects and prevents prompt injection attacks
    - Uses semantic analysis for advanced attack detection
    - Progressive versions with improved detection capabilities
