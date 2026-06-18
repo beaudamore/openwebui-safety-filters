@@ -8,11 +8,11 @@ requirements: pydantic
 from typing import Optional, Callable, Awaitable, List, Any
 from pydantic import BaseModel, Field
 import datetime
+import inspect
+import json
+import os
 from tempfile import SpooledTemporaryFile
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-from email.utils import formataddr
+from urllib import request as urllib_request
 
 # Local Open WebUI imports (guarded for environments outside runtime)
 try:
@@ -32,6 +32,18 @@ except ImportError:  # pragma: no cover - guarded optional runtime deps
     ProcessFileForm = None
     UploadFile = None
     run_in_threadpool = None
+
+
+async def _call_openwebui(func, *args, **kwargs):
+    if inspect.iscoroutinefunction(func):
+        return await func(*args, **kwargs)
+    if run_in_threadpool:
+        result = await run_in_threadpool(func, *args, **kwargs)
+    else:
+        result = func(*args, **kwargs)
+    if inspect.isawaitable(result):
+        return await result
+    return result
 
 
 class Filter:
@@ -63,29 +75,21 @@ class Filter:
             default=3,
             description="Maximum number of violations before user lockout.",
         )
-        admin_email: str = Field(
-            default="",
-            description="Admin email address to notify on lockout.",
+        enable_webhook_notifications: bool = Field(
+            default=False,
+            description="Send a webhook notification when a user is locked out.",
         )
-        smtp_host: str = Field(
-            default="smtp.gmail.com",
-            description="SMTP server hostname.",
+        notification_webhook_url_env: str = Field(
+            default="PROMPT_INJECTION_WEBHOOK_URL",
+            description="Environment variable containing the webhook URL.",
         )
-        smtp_port: int = Field(
-            default=587,
-            description="SMTP server port.",
+        notification_webhook_subject: str = Field(
+            default="Prompt injection lockout",
+            description="Subject/title included in webhook notification payloads.",
         )
-        smtp_user: str = Field(
-            default="",
-            description="SMTP username.",
-        )
-        smtp_password: str = Field(
-            default="",
-            description="SMTP password.",
-        )
-        smtp_use_tls: bool = Field(
-            default=True,
-            description="Use TLS encryption.",
+        notification_webhook_timeout: float = Field(
+            default=10.0,
+            description="Webhook request timeout in seconds.",
         )
 
     def __init__(self):
@@ -137,14 +141,14 @@ class Filter:
             # Try to update user role to 'pending'
             # Assuming Users.update_user_role_by_id exists
             if hasattr(Users, "update_user_role_by_id"):
-                await run_in_threadpool(Users.update_user_role_by_id, user_id, "pending")
+                await _call_openwebui(Users.update_user_role_by_id, user_id, "pending")
                 self._dbg_step(f"User {user_id} disabled via update_user_role_by_id")
                 return True
             # Fallback: try update_user_by_id
             elif hasattr(Users, "update_user_by_id"):
-                 await run_in_threadpool(Users.update_user_by_id, user_id, {"role": "pending"})
-                 self._dbg_step(f"User {user_id} disabled via update_user_by_id")
-                 return True
+                await _call_openwebui(Users.update_user_by_id, user_id, {"role": "pending"})
+                self._dbg_step(f"User {user_id} disabled via update_user_by_id")
+                return True
             else:
                 self._dbg_step("Could not find method to disable user (Users.update_user_role_by_id or Users.update_user_by_id)")
                 return False
@@ -152,46 +156,62 @@ class Filter:
             self._dbg_step(f"Error disabling user: {e}")
             return False
 
-    async def _send_email(self, user_id: str, content: str, reason: str) -> None:
+    def _user_value(self, user: Optional[dict], key: str, default: str = "unknown") -> str:
+        if not user:
+            return default
+        value = user.get(key, default) if isinstance(user, dict) else getattr(user, key, default)
+        if value is None or value == "":
+            return default
+        return str(value)
+
+    async def _send_webhook_notification(self, user: Optional[dict], content: str, reason: str) -> None:
         """
-        Send an email notification to the admin.
+        Send a lockout notification to a configured webhook.
         """
-        if not self.valves.admin_email:
-            self._dbg_step("No admin email configured, skipping email notification")
+        if not self.valves.enable_webhook_notifications:
+            self._dbg_step("Webhook notifications disabled, skipping notification")
             return
 
-        self._dbg_step(f"Sending email notification to {self.valves.admin_email}")
-        
-        subject = f"User Lockout Notification: {user_id}"
-        body = f"""
-User {user_id} has been locked out due to excessive prompt injection violations.
+        webhook_url = ""
+        webhook_url_env = self.valves.notification_webhook_url_env.strip()
+        if webhook_url_env:
+            webhook_url = os.getenv(webhook_url_env, "").strip()
 
-Reason: {reason}
-Timestamp: {datetime.datetime.now().isoformat()}
-
-Last Content:
-{self._truncate(content, 1000)}
-"""
-
-        msg = MIMEMultipart()
-        msg["From"] = formataddr((self.valves.smtp_user or "Open WebUI", self.valves.smtp_user))
-        msg["To"] = self.valves.admin_email
-        msg["Subject"] = subject
-        msg.attach(MIMEText(body, "plain"))
+        if not webhook_url:
+            self._dbg_step("No webhook URL found in configured environment variable, skipping notification")
+            return
 
         try:
+            user_id = self._user_value(user, "id")
+            user_name = self._user_value(user, "name")
+            user_email = self._user_value(user, "email")
+            generic_payload = {
+                "event": "prompt_injection_lockout",
+                "subject": self.valves.notification_webhook_subject,
+                "user_id": user_id,
+                "user_name": user_name,
+                "user_email": user_email,
+                "reason": reason,
+                "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "content_preview": self._truncate(content, 1000),
+            }
+            body = json.dumps(generic_payload).encode("utf-8")
+            headers = {"Content-Type": "application/json"}
+
             def send():
-                with smtplib.SMTP(self.valves.smtp_host, self.valves.smtp_port) as server:
-                    if self.valves.smtp_use_tls:
-                        server.starttls()
-                    if self.valves.smtp_user and self.valves.smtp_password:
-                        server.login(self.valves.smtp_user, self.valves.smtp_password)
-                    server.send_message(msg)
-            
-            await run_in_threadpool(send)
-            self._dbg_step("Email notification sent successfully")
+                req = urllib_request.Request(
+                    webhook_url,
+                    data=body,
+                    headers=headers,
+                    method="POST",
+                )
+                with urllib_request.urlopen(req, timeout=self.valves.notification_webhook_timeout) as response:
+                    return response.status
+
+            status = await run_in_threadpool(send) if run_in_threadpool else send()
+            self._dbg_step(f"Webhook notification sent successfully: HTTP {status}")
         except Exception as e:
-            self._dbg_step(f"Error sending email: {e}")
+            self._dbg_step(f"Error sending webhook notification: {e}")
 
     async def _increment_violation_count(self, user_id: str) -> int:
         """
@@ -204,7 +224,7 @@ Last Content:
 
         try:
             # 1. Get the current user object
-            user = await run_in_threadpool(Users.get_user_by_id, user_id)
+            user = await _call_openwebui(Users.get_user_by_id, user_id)
             if not user:
                 self._dbg_step(f"User {user_id} not found")
                 return 0
@@ -221,7 +241,7 @@ Last Content:
             current_info["violation_count"] = new_count
             
             # 4. Persist the changes
-            await run_in_threadpool(Users.update_user_by_id, user_id, {"info": current_info})
+            await _call_openwebui(Users.update_user_by_id, user_id, {"info": current_info})
             self._dbg_step(f"Persisted violation count for {user_id}: {new_count}")
             
             return new_count
@@ -292,7 +312,7 @@ Last Content:
                     if violation_count >= self.valves.max_violations_count:
                         self._dbg_step(f"User {user_id} reached max violations. Locking out.")
                         if await self._disable_user(user_id):
-                            await self._send_email(user_id, user_content, injection_reason)
+                            await self._send_webhook_notification(__user__, user_content, injection_reason)
                         else:
                             self._dbg_step(f"Failed to disable user {user_id}")
                 elif user_role == "admin":
@@ -363,7 +383,7 @@ Last Content:
 
         try:
             # Resolve User object
-            user_obj = await run_in_threadpool(Users.get_user_by_id, str(user["id"]))
+            user_obj = await _call_openwebui(Users.get_user_by_id, str(user["id"]))
             if not user_obj:
                 self._dbg_step("Could not resolve User object")
                 return
@@ -373,7 +393,7 @@ Last Content:
             kb_id = None
             
             # Try to find by ID or Name
-            kbs = await run_in_threadpool(Knowledges.get_knowledge_bases_by_user_id, user_obj.id, "write")
+            kbs = await _call_openwebui(Knowledges.get_knowledge_bases_by_user_id, user_obj.id, "write")
             if kbs:
                 for kb in kbs:
                     if kb.id == kb_name or kb.name == kb_name:
@@ -410,7 +430,7 @@ Last Content:
             upload.file.seek(0)
 
             try:
-                file_data = await run_in_threadpool(
+                file_data = await _call_openwebui(
                     upload_file_handler,
                     request,
                     upload,
@@ -434,7 +454,7 @@ Last Content:
 
             # Attach to KB
             try:
-                await run_in_threadpool(
+                await _call_openwebui(
                     Knowledges.add_file_to_knowledge_by_id,
                     kb_id,
                     file_id,
@@ -442,17 +462,17 @@ Last Content:
                 )
             except AttributeError:
                  # Fallback for older versions
-                knowledge = Knowledges.get_knowledge_by_id(id=kb_id)
+                knowledge = await _call_openwebui(Knowledges.get_knowledge_by_id, id=kb_id)
                 if knowledge:
                     data = getattr(knowledge, "data", None) or {}
                     file_ids = data.get("file_ids", [])
                     if file_id not in file_ids:
                         file_ids.append(file_id)
                         data["file_ids"] = file_ids
-                        Knowledges.update_knowledge_data_by_id(id=kb_id, data=data)
+                        await _call_openwebui(Knowledges.update_knowledge_data_by_id, id=kb_id, data=data)
 
             # Process File
-            await run_in_threadpool(
+            await _call_openwebui(
                 process_file,
                 request,
                 ProcessFileForm(file_id=file_id, collection_name=kb_id, content=full_log_content),

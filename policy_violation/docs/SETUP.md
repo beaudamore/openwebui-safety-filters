@@ -2,6 +2,10 @@
 
 This guide explains how to set up and configure the Company Policy Violation Filter (v1) for Open WebUI.
 
+## Compatibility
+
+This filter is verified with Open WebUI 0.9.5. It uses async `inlet`/`outlet` handlers and calls Open WebUI internals through compatibility handling that supports both async 0.9.x APIs and older synchronous APIs with the same names and signatures.
+
 ## Overview
 
 The filter scans both incoming user messages (**inlet**) and outgoing model responses (**outlet**) for company policy violations. It uses:

@@ -1,5 +1,9 @@
 # Antivirus/Antimalware Filter for Open WebUI - Detailed Guide
 
+## Compatibility
+
+This filter is verified with Open WebUI 0.9.5. It uses an async `inlet` handler and calls Open WebUI internals through compatibility handling that supports both async 0.9.x APIs and older synchronous APIs with the same names and signatures. Blocking ClamAV and filesystem operations still run in a threadpool.
+
 ## Overview
 
 The Antivirus/Antimalware Filter provides real-time malware and virus detection for file uploads in Open WebUI. It integrates with ClamAV, an open-source antivirus engine, to scan files before they are processed or stored.

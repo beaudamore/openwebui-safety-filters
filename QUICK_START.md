@@ -1,5 +1,9 @@
 # Quick Start Guide - Safety Filters
 
+## Compatibility
+
+Verified with Open WebUI 0.9.5. The filters use async `inlet`/`outlet` handlers and include compatibility handling for Open WebUI helper APIs that may be async in 0.9.x or synchronous in older releases.
+
 ## 30-Second Setup
 
 1. **Start ClamAV** (if using antivirus filter):
@@ -28,15 +32,16 @@ delete_infected_files: False              # Keep for analysis
 
 ### Content Safety Filter
 ```python
-api_url: "http://host.docker.internal:8080"  # Safety API
-safety_model: "shieldgemma:2b"               # Detection model
-block_on_unsafe: True                        # Block unsafe content
+safety_model_id: "safety-guard-qwen3-14b"  # Open WebUI safety model
+block_on_unsafe: True                       # Block unsafe content
+S12_Profanity: False                        # Example category toggle
 ```
 
 ### Prompt Injection Filter
 ```python
 injection_detection_model_id: ""      # Model for detection
 block_on_unsafe: True                 # Block injections
+enable_webhook_notifications: False   # Webhook only on lockout when enabled
 ```
 
 ### Policy Violation Filter
@@ -100,9 +105,9 @@ Filters execute by priority (highest first):
 | File | Purpose |
 |------|---------|
 | `safety_filter_antivirus_antimalware.py` | Malware scanning |
-| `safety_filter_guard_v1.py` | Enhanced safety filtering |
+| `safety_guard_filter_v3.py` | Enhanced safety filtering |
 | `safety_filter_company_policy_violation_v1.py` | Policy enforcement |
-| `safety_filter_prompt_injection_v*.py` | Injection prevention |
+| `safety_filter_prompt_injection_v2.py` | Injection prevention |
 | `docker-compose.clamav.yml` | ClamAV container config |
 
 ## Health Check

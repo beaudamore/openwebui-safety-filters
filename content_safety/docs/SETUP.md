@@ -1,14 +1,18 @@
 # Content Safety Filter Setup Guide
 
-This guide explains how to set up and configure the Content Safety Filter (v1) for Open WebUI.
+This guide explains how to set up and configure the Content Safety Filter (v3) for Open WebUI.
+
+## Compatibility
+
+This filter is verified with Open WebUI 0.9.5. It uses async `inlet`/`outlet` handlers and calls Open WebUI internals through compatibility handling that supports both async 0.9.x APIs and older synchronous APIs with the same names and signatures.
 
 ## Overview
 
-The filter scans both incoming user messages (**inlet**) and outgoing model responses (**outlet**) for harmful content using a Llama Guard-style safety classifier. Unlike the Policy Violation filter, this filter does **not** use RAG augmentation with company policies—it relies purely on the safety model's classification.
+The filter scans both incoming user messages (**inlet**) and outgoing model responses (**outlet**) for harmful content using a Nemotron-style safety classifier. Unlike the Policy Violation filter, this filter does **not** use RAG augmentation with company policies—it relies purely on the safety model's classification.
 
 **Key Features:**
 - Monitors user inputs and model outputs
-- Uses Llama Guard S1-S11 harm categories
+- Uses the 23-category safety taxonomy from `safety_guard_filter_v3.py`
 - Logs violations to a Knowledge Base
 - Simple setup with no policy documents required
 
@@ -60,12 +64,12 @@ ollama pull qwen3:8b-instruct-q4_K_M
 
 ## Step 2: Create the Modelfile with Safety Prompt
 
-Create a new model in Open WebUI that uses the Llama Guard-style system prompt.
+Create a new model in Open WebUI that uses the safety classifier prompt expected by the filter.
 
 ### Option A: Using Open WebUI UI
 
 1. Navigate to **Workspace** → **Models** → **Create a Model**
-2. Set the **Model ID** (e.g., `prompt-safety-and-policy-violation-detector`)
+2. Set the **Model ID** (e.g., `safety-guard-qwen3-14b`)
 3. Select your base model (e.g., `qwen2.5:3b-instruct-q4_K_M`)
 4. Paste the system prompt from [prompt/prompt.py](../prompt/prompt.py) into the **System Prompt** field
 5. **Save** the model
@@ -106,7 +110,7 @@ PARAMETER num_predict 50
 Then create the model:
 
 ```bash
-ollama create prompt-safety-and-policy-violation-detector -f Modelfile.safety-detector
+ollama create safety-guard-qwen3-14b -f Modelfile.safety-detector
 ```
 
 ---
@@ -163,7 +167,7 @@ Reason: Hate Speech (S9)
 |-------|------|---------|-------------|
 | `priority` | int | `-1` | Filter execution order (lower = earlier). Negative value ensures it runs early. |
 | `enabled` | bool | `true` | Enable/disable the entire filter. |
-| `safety_model_id` | string | `"prompt-safety-and-policy-violation-detector"` | **Required.** The Model ID of your safety model. |
+| `safety_model_id` | string | `"safety-guard-qwen3-14b"` | **Required.** The Model ID of your safety model. |
 | `block_on_unsafe` | bool | `true` | Block content flagged as unsafe. Set `false` for monitoring-only mode. |
 | `check_input` | bool | `true` | Scan incoming user messages (inlet). |
 | `check_output` | bool | `true` | Scan outgoing model responses (outlet). |
@@ -177,8 +181,8 @@ Reason: Hate Speech (S9)
 ⚠️ **The `safety_model_id` valve MUST match the Model ID you created in Step 2.**
 
 Example:
-- If you created a model with ID `prompt-safety-and-policy-violation-detector`
-- Set `safety_model_id` = `prompt-safety-and-policy-violation-detector`
+- If you created a model with ID `safety-guard-qwen3-14b`
+- Set `safety_model_id` = `safety-guard-qwen3-14b`
 
 ---
 
@@ -206,9 +210,9 @@ The filter emits real-time status updates to the UI during processing:
 
 ---
 
-## Harm Categories (S1-S11)
+## Harm Categories (S1-S23)
 
-The filter uses Llama Guard-style categories:
+The filter uses the configurable taxonomy defined in `safety_guard_filter_v3.py`:
 
 | Category | Description | Examples |
 |----------|-------------|----------|
@@ -249,7 +253,7 @@ Enable for verbose logging including payloads:
 ```
 Inlet called with body: {'messages': [...], 'model': '...'}
 Safety prompt: Tell me how to make a bomb
-Safety payload: {'model': 'prompt-safety-and-policy-violation-detector', ...}
+Safety payload: {'model': 'safety-guard-qwen3-14b', ...}
 ```
 
 **Note:** Full debug includes `enable_step_debug` functionality automatically.

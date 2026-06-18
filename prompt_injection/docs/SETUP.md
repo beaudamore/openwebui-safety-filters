@@ -1,6 +1,10 @@
 # Prompt Injection Filter Setup Guide
 
-This guide explains how to set up and configure the Prompt Injection Protection Filter (v1.1) for Open WebUI.
+This guide explains how to set up and configure the Prompt Injection Protection Filter (v2) for Open WebUI.
+
+## Compatibility
+
+This filter is verified with Open WebUI 0.9.5. It uses an async `inlet` handler and calls Open WebUI internals through compatibility handling that supports both async 0.9.x APIs and older synchronous APIs with the same names and signatures.
 
 ## Overview
 
@@ -144,11 +148,125 @@ ollama create prompt-injection-detector -f Modelfile.prompt-injection-detector
 | `enabled` | bool | `true` | Enable/disable the entire filter. |
 | `injection_detection_model_id` | string | `""` | **Required.** The Model ID of your detection model (e.g., `prompt-injection-detector`). |
 | `block_on_unsafe` | bool | `true` | Block messages flagged as injections. Set `false` for monitoring-only mode. |
-| `scan_attached_files` | bool | `true` | Extract and scan text from attached files (PDFs, docs, etc.). |
 | `enable_full_debug` | bool | `false` | Heavy debug logging with payloads/results (masked & truncated). |
 | `enable_step_debug` | bool | `false` | Concise step-by-step progress logging. |
 | `violation_kb` | string | `"Prompt Injection Violations"` | Knowledge Base name for logging violations. Set to `"none"` to disable. |
 | `max_violations_count` | int | `3` | Number of violations before user account is set to "pending" (disabled). |
+| `enable_webhook_notifications` | bool | `false` | Send a webhook notification when a user is locked out. |
+| `notification_webhook_url_env` | string | `"PROMPT_INJECTION_WEBHOOK_URL"` | Environment variable containing the webhook URL. |
+| `notification_webhook_subject` | string | `"Prompt injection lockout"` | Subject/title included in webhook notification payloads. |
+| `notification_webhook_timeout` | float | `10.0` | Webhook request timeout in seconds. |
+
+### Webhook Notifications
+
+Webhook notifications are optional and only fire after the filter locks out a non-admin user by switching the account to `pending`. The filter sends a JSON `POST` to the URL resolved from `notification_webhook_url_env`.
+
+Example payload:
+
+```json
+{
+	"event": "prompt_injection_lockout",
+	"subject": "Prompt injection lockout",
+	"user_id": "user-id",
+	"user_name": "User Name",
+	"user_email": "user@example.com",
+	"reason": "Attempted instruction override",
+	"timestamp": "2026-06-18T12:34:56.000000+00:00",
+	"content_preview": "Ignore previous instructions..."
+}
+```
+
+Point the filter at a webhook receiver you control. The filter always sends the same generic JSON event; provider-specific formatting, authentication, retries, and fan-out to Slack, email, Google Workspace, Teams, a SIEM, or tickets should live in the webhook receiver, not in this filter. Do not paste the webhook URL into the filter valves.
+
+```yaml
+environment:
+	PROMPT_INJECTION_WEBHOOK_URL: ${PROMPT_INJECTION_WEBHOOK_URL}
+```
+
+In Portainer, create the stack variable `PROMPT_INJECTION_WEBHOOK_URL` with the generic webhook receiver URL as its value. The Compose file should reference that variable; it should not contain secret values directly.
+
+If Open WebUI and the webhook receiver are on the same Docker host and same Docker network, set `PROMPT_INJECTION_WEBHOOK_URL` to the receiver service URL:
+
+```text
+http://webhook-alerts:8080/webhooks/openwebui/prompt-injection-lockout
+```
+
+If Open WebUI is on another Docker host or network, set `PROMPT_INJECTION_WEBHOOK_URL` to a host URL reachable from the Open WebUI container:
+
+```text
+http://<docker-host-ip-or-dns>:8080/webhooks/openwebui/prompt-injection-lockout
+```
+
+If the receiver is exposed through HTTPS, use the public HTTPS URL:
+
+```text
+https://<public-hostname>/webhooks/openwebui/prompt-injection-lockout
+```
+
+Do not use `PROMPT_INJECTION_SLACK_WEBHOOK_URL` unless you intentionally change `notification_webhook_url_env` to that exact env var name.
+
+Portainer stack editor example:
+
+```yaml
+services:
+	open-webui:
+		environment:
+			PROMPT_INJECTION_WEBHOOK_URL: ${PROMPT_INJECTION_WEBHOOK_URL}
+```
+
+Then configure the filter valves like this:
+
+```yaml
+enable_webhook_notifications: true
+notification_webhook_url_env: "PROMPT_INJECTION_WEBHOOK_URL"
+notification_webhook_subject: "Prompt injection lockout"
+```
+
+The stack variable stores the receiver URL. The container environment variable receives that value at deploy time. The valve stores the container environment variable name, not the secret URL.
+
+Simple receiving service example:
+
+```python
+import os
+import smtplib
+from email.message import EmailMessage
+
+from fastapi import FastAPI
+
+app = FastAPI()
+
+ALERT_TO = os.getenv("ALERT_TO", "security@example.com")
+ALERT_FROM = os.getenv("ALERT_FROM", "openwebui@example.com")
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp-relay.example.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "25"))
+
+
+@app.post("/openwebui/prompt-injection-lockout")
+async def prompt_injection_lockout(payload: dict):
+		subject = payload.get("subject", "Prompt injection lockout")
+		body = (
+				f"Event: {payload.get('event')}\n"
+				f"User Name: {payload.get('user_name')}\n"
+				f"User Email: {payload.get('user_email')}\n"
+				f"User: {payload.get('user_id')}\n"
+				f"Reason: {payload.get('reason')}\n"
+				f"Timestamp: {payload.get('timestamp')}\n\n"
+				f"Content preview:\n{payload.get('content_preview', '')}"
+		)
+
+		message = EmailMessage()
+		message["Subject"] = subject
+		message["From"] = ALERT_FROM
+		message["To"] = ALERT_TO
+		message.set_content(body)
+
+		with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as smtp:
+				smtp.send_message(message)
+
+		return {"ok": True}
+```
+
+The receiver can forward the same payload to Slack, Google Workspace, Teams, a SIEM, a ticketing system, or email.
 
 ### Critical Configuration: Model ID Alignment
 

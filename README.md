@@ -24,30 +24,35 @@ This repository contains multiple safety filter implementations designed to prot
    - Integrates with ClamAV daemon for real-time threat detection
    - Automatically blocks infected files and logs violations
 
-2. **Content Safety Filter** (`content_safety/filter/`)
+2. **Content Safety Filter** (`content_safety/filter/safety_guard_filter_v3.py`)
    - Filters user inputs and model outputs for harmful content
-   - Uses external safety API for content classification
-   - Detects: Dangerous Content, Hate Speech, Harassment, Sexually Explicit material
-
-3. **Enhanced Safety Filter** (`content_safety/filter/safety_filter_guard_v1.py`)
+    - Uses an internal Open WebUI safety model for content classification
+    - Detects a configurable 23-category safety taxonomy
    - Advanced safety filtering with policy augmentation
    - Integrates with Open WebUI's internal chat completion system
    - Supports optional policy augmentation via direct API calls
    - Includes comprehensive logging and debugging capabilities
 
-4. **Policy Violation Filter** (`policy_violation/filter/safety_filter_company_policy_violation_v1.py`)
+3. **Policy Violation Filter** (`policy_violation/filter/safety_filter_company_policy_violation_v1.py`)
    - Detects potential company policy violations in user input and model output
    - Uses Open WebUI's internal chat system and vector database
    - Customizable policy rules and violation detection thresholds
    - Tracks violation history per user
 
-5. **Prompt Injection Filters** (`prompt_injection/filter/` — versions: v1, v1.1, v2)
+4. **Prompt Injection Filter** (`prompt_injection/filter/safety_filter_prompt_injection_v2.py`)
    - Detects and prevents prompt injection attacks
    - Uses semantic analysis for advanced attack detection
-   - Progressive versions with improved detection capabilities
    - Configurable detection models and sensitivity levels
 
 ## Installation
+
+## Open WebUI Compatibility
+
+These filters target the current Open WebUI filter-function interface and are verified against Open WebUI 0.9.5.
+
+The retained filters use `async def inlet(...)` and `async def outlet(...)`, which Open WebUI 0.9.x awaits directly. Internal Open WebUI calls are made through a small compatibility helper that supports both async 0.9.x APIs and older synchronous APIs, so the same filter files should remain compatible with earlier Open WebUI releases that expose the same module and method names.
+
+Known compatibility boundary: Open WebUI changed many model, knowledge, file, and router helpers to async in the 0.9.x series. If you run an older Open WebUI release whose helper names or signatures differ, the filters may need a small adapter update. Prefer using the current single filter implementation per family instead of restoring older versioned copies.
 
 ### Prerequisites
 
@@ -135,14 +140,8 @@ enable_step_debug: bool = False
 **Configuration Options:**
 
 ```python
-api_url: str = "http://host.docker.internal:8080"
-    # Safety API endpoint URL
-
-api_key: str = ""
-    # API authentication key
-
-safety_model: str = "shieldgemma:2b"
-    # Model used for safety classification
+safety_model_id: str = "safety-guard-qwen3-14b"
+    # Open WebUI model ID for the safety classifier
 
 check_input: bool = True
     # Check user input messages
@@ -154,7 +153,7 @@ block_on_unsafe: bool = True
     # Block unsafe content
 
 harm_categories: List[str]
-    # Categories to detect (see filter file for full list)
+    # Use S1_* through S23_* valves to enable/disable categories
 ```
 
 ### Policy Violation Filter
@@ -194,6 +193,53 @@ enable_full_debug: bool = False
 
 enable_step_debug: bool = False
     # Step-by-step progress logs
+
+enable_webhook_notifications: bool = False
+    # Send webhook notification when a user is locked out
+
+notification_webhook_url_env: str = "PROMPT_INJECTION_WEBHOOK_URL"
+    # Env var containing the webhook URL
+
+notification_webhook_subject: str = "Prompt injection lockout"
+    # Subject/title included in webhook payloads
+```
+
+The webhook sends a generic JSON `POST` with `event`, `subject`, `user_id`, `user_name`, `user_email`, `reason`, `timestamp`, and `content_preview`. Put webhook secrets in the Open WebUI container environment, not in filter valves. Provider-specific formatting and fan-out to Slack, Google Workspace, email, tickets, or other alerting systems should live in the webhook receiver.
+
+For Compose or Portainer, add this environment variable to the Open WebUI container:
+
+```yaml
+environment:
+    PROMPT_INJECTION_WEBHOOK_URL: ${PROMPT_INJECTION_WEBHOOK_URL}
+```
+
+In Portainer, create the stack variable `PROMPT_INJECTION_WEBHOOK_URL` with the generic webhook receiver URL as its value. The stack YAML should reference the variable; it should not contain the URL directly.
+
+If Open WebUI and the webhook receiver are on the same Docker host and same Docker network, use:
+
+```text
+http://webhook-alerts:8080/webhooks/openwebui/prompt-injection-lockout
+```
+
+If Open WebUI is on another Docker host or network, use a URL reachable from the Open WebUI container:
+
+```text
+http://<docker-host-ip-or-dns>:8080/webhooks/openwebui/prompt-injection-lockout
+```
+
+If the receiver is exposed through HTTPS, use the public HTTPS URL:
+
+```text
+https://<public-hostname>/webhooks/openwebui/prompt-injection-lockout
+```
+
+Do not use `PROMPT_INJECTION_SLACK_WEBHOOK_URL` unless you intentionally change `notification_webhook_url_env` to that exact env var name.
+
+Then set the filter valves to reference the env var name:
+
+```yaml
+enable_webhook_notifications: true
+notification_webhook_url_env: "PROMPT_INJECTION_WEBHOOK_URL"
 ```
 
 ## Architecture

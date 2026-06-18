@@ -10,6 +10,7 @@ import json
 import re
 import logging
 import datetime
+import inspect
 from typing import Optional, Callable, Awaitable, Any
 from tempfile import SpooledTemporaryFile
 from pydantic import BaseModel, Field
@@ -34,6 +35,18 @@ except ImportError:  # pragma: no cover - guarded optional runtime deps
     run_in_threadpool = None
 
 logger = logging.getLogger(__name__)
+
+
+async def _call_openwebui(func, *args, **kwargs):
+    if inspect.iscoroutinefunction(func):
+        return await func(*args, **kwargs)
+    if run_in_threadpool:
+        result = await run_in_threadpool(func, *args, **kwargs)
+    else:
+        result = func(*args, **kwargs)
+    if inspect.isawaitable(result):
+        return await result
+    return result
 
 
 # ─── Full 23-category Aegis 2.0 / Nemotron taxonomy ─────────────────────────
@@ -465,7 +478,7 @@ class Filter:
 
         try:
             # Resolve User object
-            user_obj = await run_in_threadpool(Users.get_user_by_id, str(__user__["id"]))
+            user_obj = await _call_openwebui(Users.get_user_by_id, str(__user__["id"]))
             if not user_obj:
                 logger.warning("[SafetyGuard] Could not resolve User object for KB logging")
                 return
@@ -474,7 +487,7 @@ class Filter:
             kb_name = self.valves.violation_kb.strip()
             kb_id = None
 
-            kbs = await run_in_threadpool(
+            kbs = await _call_openwebui(
                 Knowledges.get_knowledge_bases_by_user_id, user_obj.id, "write"
             )
             if kbs:
@@ -493,7 +506,7 @@ class Filter:
                         description="Auto-created by Safety Guard Filter v3 for violation logging",
                         data={},
                     )
-                    new_kb = await run_in_threadpool(
+                    new_kb = await _call_openwebui(
                         Knowledges.insert_new_knowledge,
                         user_obj.id,
                         knowledge_form,
@@ -537,7 +550,7 @@ class Filter:
             upload.file.seek(0)
 
             try:
-                file_data = await run_in_threadpool(
+                file_data = await _call_openwebui(
                     upload_file_handler,
                     __request__,
                     upload,
@@ -561,7 +574,7 @@ class Filter:
 
             # Attach file to KB
             try:
-                await run_in_threadpool(
+                await _call_openwebui(
                     Knowledges.add_file_to_knowledge_by_id,
                     kb_id,
                     file_id,
@@ -569,17 +582,17 @@ class Filter:
                 )
             except AttributeError:
                 # Fallback for older OpenWebUI versions
-                knowledge = Knowledges.get_knowledge_by_id(id=kb_id)
+                knowledge = await _call_openwebui(Knowledges.get_knowledge_by_id, id=kb_id)
                 if knowledge:
                     data = getattr(knowledge, "data", None) or {}
                     file_ids = data.get("file_ids", [])
                     if file_id not in file_ids:
                         file_ids.append(file_id)
                         data["file_ids"] = file_ids
-                        Knowledges.update_knowledge_data_by_id(id=kb_id, data=data)
+                        await _call_openwebui(Knowledges.update_knowledge_data_by_id, id=kb_id, data=data)
 
             # Process/index the file so it's searchable
-            await run_in_threadpool(
+            await _call_openwebui(
                 process_file,
                 __request__,
                 ProcessFileForm(file_id=file_id, collection_name=kb_id, content=full_log_content),

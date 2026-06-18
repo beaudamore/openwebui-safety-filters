@@ -10,6 +10,7 @@ from typing import Optional, Callable, Awaitable, List, Any
 from pydantic import BaseModel, Field
 import unicodedata
 import datetime  # For datetime logging
+import inspect
 from tempfile import SpooledTemporaryFile
 
 # Local Open WebUI imports (guarded for environments outside runtime)
@@ -32,6 +33,18 @@ except ImportError:  # pragma: no cover - guarded optional runtime deps
     ProcessFileForm = None
     UploadFile = None
     run_in_threadpool = None
+
+
+async def _call_openwebui(func, *args, **kwargs):
+    if inspect.iscoroutinefunction(func):
+        return await func(*args, **kwargs)
+    if run_in_threadpool:
+        result = await run_in_threadpool(func, *args, **kwargs)
+    else:
+        result = func(*args, **kwargs)
+    if inspect.isawaitable(result):
+        return await result
+    return result
 
 
 class Filter:
@@ -297,7 +310,7 @@ class Filter:
 
         try:
             # Resolve User object
-            user_obj = await run_in_threadpool(Users.get_user_by_id, str(user["id"]))
+            user_obj = await _call_openwebui(Users.get_user_by_id, str(user["id"]))
             if not user_obj:
                 self._dbg_step("Could not resolve User object")
                 return
@@ -307,7 +320,7 @@ class Filter:
             kb_id = None
             
             # Try to find by ID or Name
-            kbs = await run_in_threadpool(Knowledges.get_knowledge_bases_by_user_id, user_obj.id, "write")
+            kbs = await _call_openwebui(Knowledges.get_knowledge_bases_by_user_id, user_obj.id, "write")
             if kbs:
                 for kb in kbs:
                     if kb.id == kb_name or kb.name == kb_name:
@@ -343,7 +356,7 @@ class Filter:
             upload.file.seek(0)
 
             try:
-                file_data = await run_in_threadpool(
+                file_data = await _call_openwebui(
                     upload_file_handler,
                     request,
                     upload,
@@ -367,7 +380,7 @@ class Filter:
 
             # Attach to KB
             try:
-                await run_in_threadpool(
+                await _call_openwebui(
                     Knowledges.add_file_to_knowledge_by_id,
                     kb_id,
                     file_id,
@@ -375,17 +388,17 @@ class Filter:
                 )
             except AttributeError:
                  # Fallback for older versions
-                knowledge = Knowledges.get_knowledge_by_id(id=kb_id)
+                knowledge = await _call_openwebui(Knowledges.get_knowledge_by_id, id=kb_id)
                 if knowledge:
                     data = getattr(knowledge, "data", None) or {}
                     file_ids = data.get("file_ids", [])
                     if file_id not in file_ids:
                         file_ids.append(file_id)
                         data["file_ids"] = file_ids
-                        Knowledges.update_knowledge_data_by_id(id=kb_id, data=data)
+                        await _call_openwebui(Knowledges.update_knowledge_data_by_id, id=kb_id, data=data)
 
             # Process File
-            await run_in_threadpool(
+            await _call_openwebui(
                 process_file,
                 request,
                 ProcessFileForm(file_id=file_id, collection_name=kb_id, content=full_log_content),
@@ -425,7 +438,7 @@ class Filter:
                 self._dbg_step("Local KB names:", kb_names)
                 snippets: List[str] = []
                 try:
-                    kb_list = Knowledges.get_knowledge_bases() if Knowledges else []
+                    kb_list = await _call_openwebui(Knowledges.get_knowledge_bases) if Knowledges else []
                     name_to_id = {kb.name: kb.id for kb in kb_list}
                 except (AttributeError, RuntimeError) as e:
                     self._dbg_step(f"Failed to load knowledge bases locally: {e}")
