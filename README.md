@@ -17,6 +17,8 @@ A comprehensive collection of content filtering and safety modules for Open WebU
 
 This repository contains multiple safety filter implementations designed to protect Open WebUI deployments by scanning user inputs and model outputs for various threats and policy violations. All filters follow the Open WebUI Filter interface specification.
 
+Shared Open WebUI extension patterns used by these filters are documented in [docs/openwebui-internal-library-patterns.md](docs/openwebui-internal-library-patterns.md).
+
 ### Available Filters
 
 1. **Antivirus/Antimalware Filter** (`antivirus/filter/safety_filter_antivirus_antimalware.py`)
