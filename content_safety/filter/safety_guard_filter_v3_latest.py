@@ -1,11 +1,13 @@
 """
 title: Safety Guard Filter v3 (Nemotron Classifier)
 author: spark
-version: 3.0.2
+version: 3.1.0
 requirements: pydantic
+openwebui: 0.11.3 (verified 2026-09-12, image ghcr.io/open-webui/open-webui:main @ 0a7c158)
 description: Nemotron-style 23-category safety classifier filter for Qwen3-14B Safety Guard LoRA
 """
 
+import asyncio
 import json
 import re
 import logging
@@ -34,6 +36,16 @@ except ImportError:  # pragma: no cover - guarded optional runtime deps
     AsyncSessionLocal = None
 
 logger = logging.getLogger(__name__)
+
+
+FILTER_BLOCK_AWARE = True  # this filter records blocks in the shared record and defers to later block-aware filters
+
+try:
+    from open_webui.utils.filter import resolve_filter_pipeline  # type: ignore
+    from open_webui.utils.plugin import get_function_module_from_cache  # type: ignore
+except ImportError:  # pragma: no cover
+    resolve_filter_pipeline = None
+    get_function_module_from_cache = None
 
 
 # ─── Full 23-category Aegis 2.0 / Nemotron taxonomy ─────────────────────────
@@ -68,9 +80,11 @@ class Filter:
     """
     Nemotron-style safety classifier filter for OpenWebUI.
 
-    Inlet:  checks user message before it reaches the main model.
-    Outlet: checks assistant response before it's shown to the user.
+    Inlet: checks user message before it reaches the main model.
     """
+
+    # Also on the class: Open WebUI's function cache hands back the Filter instance, not the module.
+    FILTER_BLOCK_AWARE = True
 
     class Valves(BaseModel):
         priority: int = Field(
@@ -89,15 +103,13 @@ class Filter:
             default=True,
             description="Block unsafe content (True) or just log it (False)",
         )
-        check_input: bool = Field(
-            default=True, description="Run safety check on user input (inlet)"
+        block_mode: str = Field(
+            default="message",
+            description="'message': show block_message as the reply and end the turn without calling the model, so the chat stays usable. 'error': raise an error on the message (old behaviour).",
         )
-        check_output: bool = Field(
-            default=True, description="Run safety check on assistant output (outlet)"
-        )
-        unsafe_message: str = Field(
-            default="I'm unable to process this request as it may involve unsafe content.",
-            description="Message shown to user when content is blocked",
+        block_message: str = Field(
+            default="⛔ This message was blocked by a safety filter and was not sent to the model. You can continue the conversation.",
+            description="Static text shown as the assistant reply when a prompt is blocked (block_mode='message').",
         )
         classifier_temperature: float = Field(
             default=0.0,
@@ -178,6 +190,71 @@ class Filter:
             "S22_Illegal_Activity": "S22",
             "S23_Immoral_Unethical": "S23",
         }
+
+    def _dbg_step(self, *parts: Any) -> None:
+        """Route the shared block-pattern helpers' messages to this filter's logger."""
+        if self.valves.enable_step_debug:
+            logger.info("[SafetyGuard] " + " ".join(str(p) for p in parts))
+
+    async def _block_turn(self, __event_emitter__, body: Optional[dict] = None) -> None:
+        """Show the static block message plus every recorded reason as the reply and end the
+        turn without calling the model."""
+        record = ((body or {}).get("metadata") or {}).get("filter_block") or {}
+        reasons = [str(r) for r in record.get("reasons", []) if r]
+        text = self.valves.block_message
+        if reasons:
+            text += "\n\n" + "\n".join(f"- {r[:1].upper()}{r[1:]}" for r in reasons)
+        if __event_emitter__:
+            await __event_emitter__({"type": "replace", "data": {"content": text}})
+        raise asyncio.CancelledError("blocked by filter")
+
+    def _record_block(self, body: dict, reason: str) -> None:
+        """Record a violation in the shared block record (request metadata, never sent to the model).
+        The prompt is left untouched so later filters scan the same original text."""
+        meta = body.setdefault("metadata", {})
+        record = meta.setdefault("filter_block", {"reasons": []})
+        record.setdefault("reasons", []).append(reason)
+        self._dbg_step(f"Block recorded: {reason}")
+
+    async def _enforce_block_if_last(
+        self, body, __event_emitter__, __request__, __model__, __metadata__, __id__
+    ) -> None:
+        """If anything was recorded and no later block-aware filter will run, show the static
+        block message and end the turn. If the chain cannot be resolved, block immediately."""
+        record = (body.get("metadata") or {}).get("filter_block")
+        if not record or not record.get("reasons"):
+            return
+        try:
+            if not (resolve_filter_pipeline and get_function_module_from_cache and __request__ and __model__):
+                raise RuntimeError("filter chain helpers unavailable")
+            enabled_ids = (__metadata__ or body.get("metadata") or {}).get("filter_ids", []) or []
+            chain, _ = await resolve_filter_pipeline(__request__, __model__, enabled_ids)
+            later = chain[chain.index(__id__) + 1 :] if __id__ in chain else []
+            for fid in later:
+                module, _, _ = await get_function_module_from_cache(__request__, fid)
+                if getattr(module, "FILTER_BLOCK_AWARE", False):
+                    self._dbg_step(f"Block recorded; deferring final block to later filter '{fid}'")
+                    return
+        except Exception as e:
+            self._dbg_step(f"Could not resolve filter chain ({e}); blocking now")
+        await self._block_turn(__event_emitter__, body)
+
+    def _scrub_blocked_history(self, messages: list) -> list:
+        """Drop earlier blocked user messages and their block replies so blocked content never reaches the model as history."""
+        blocked = self.valves.block_message.strip()
+        out: list = []
+        for m in messages:
+            content = m.get("content", "")
+            if (
+                m.get("role") == "assistant"
+                and isinstance(content, str)
+                and content.strip().startswith(blocked)
+            ):
+                if out and out[-1].get("role") == "user":
+                    out.pop()
+                continue
+            out.append(m)
+        return out
 
     # ─── Taxonomy builder (respects valve toggles) ───────────────────────────
 
@@ -403,6 +480,7 @@ class Filter:
                         "response_safe": None,
                         "categories": [],
                         "raw": "",
+                        "error": "empty model response",
                     }
                 message = choices[0].get("message", {})
                 raw_output = message.get("content", "")
@@ -415,6 +493,7 @@ class Filter:
                     "response_safe": None,
                     "categories": [],
                     "raw": "",
+                    "error": f"unexpected response type {type(response).__name__}",
                 }
 
             if self.valves.enable_full_debug:
@@ -448,6 +527,7 @@ class Filter:
                 "response_safe": None,
                 "categories": [],
                 "raw": f"ERROR: {e}",
+                "error": str(e),
             }
 
     # ─── Violation logging ───────────────────────────────────────────────────
@@ -514,7 +594,8 @@ class Filter:
             kb_name = self.valves.violation_kb.strip()
             kb_id = None
 
-            kbs = await Knowledges.get_knowledge_bases_by_user_id(user_obj.id, "write")
+            # the per-user knowledge lookup was removed from Open WebUI; list all and match by id or name
+            kbs = await Knowledges.get_knowledge_bases()
             if kbs:
                 for kb in kbs:
                     if kb.id == kb_name or kb.name == kb_name:
@@ -657,12 +738,31 @@ class Filter:
         __user__: Optional[dict] = None,
         __event_emitter__: Optional[Callable[[dict], Awaitable[None]]] = None,
         __request__: Optional[Any] = None,
+        __model__: Optional[dict] = None,
+        __metadata__: Optional[dict] = None,
+        __id__: Optional[str] = None,
+    ) -> dict:
+        body = await self._inlet_impl(
+            body,
+            __user__=__user__,
+            __event_emitter__=__event_emitter__,
+            __request__=__request__,
+        )
+        await self._enforce_block_if_last(
+            body, __event_emitter__, __request__, __model__, __metadata__, __id__
+        )
+        return body
+
+    async def _inlet_impl(
+        self,
+        body: dict,
+        __user__: Optional[dict] = None,
+        __event_emitter__: Optional[Callable[[dict], Awaitable[None]]] = None,
+        __request__: Optional[Any] = None,
     ) -> dict:
         """Check user input for safety before passing to the main model."""
-        if not self.valves.check_input:
-            return body
-
-        messages = body.get("messages", [])
+        messages = self._scrub_blocked_history(body.get("messages", []))
+        body["messages"] = messages
         if not messages:
             return body
 
@@ -695,7 +795,11 @@ class Filter:
         )
 
         if __event_emitter__:
-            safe_str = "\u2713 Safe" if result["user_safe"] else "\u26a0 Unsafe"
+            if result.get("error"):
+                # A failed check must not read as a pass.
+                safe_str = f"FAILED (not enforced): {result['error']}"
+            else:
+                safe_str = "\u2713 Safe" if result["user_safe"] else "\u26a0 Unsafe"
             await __event_emitter__(
                 {
                     "type": "status",
@@ -717,110 +821,10 @@ class Filter:
             await self._log_violation("inlet", user_msg, result, __user__, __request__)
 
             if self.valves.block_on_unsafe:
-                raise ValueError(f"Content blocked by safety filter: {cats}")
-
-        return body
-
-    # ─── Outlet (assistant response check) ───────────────────────────────────
-
-    async def outlet(
-        self,
-        body: dict,
-        __user__: Optional[dict] = None,
-        __event_emitter__: Optional[Callable[[dict], Awaitable[None]]] = None,
-        __request__: Optional[Any] = None,
-    ) -> dict:
-        """Check assistant response for safety before showing to user."""
-        if not self.valves.check_output:
-            return body
-
-        messages = body.get("messages", [])
-        if not messages:
-            return body
-
-        # Find the last user message and last assistant message
-        user_msg = ""
-        assistant_msg = ""
-        for msg in reversed(messages):
-            if msg.get("role") == "assistant" and not assistant_msg:
-                assistant_msg = msg.get("content", "")
-            elif msg.get("role") == "user" and not user_msg:
-                user_msg = msg.get("content", "")
-            if user_msg and assistant_msg:
-                break
-
-        if not assistant_msg or not assistant_msg.strip():
-            return body
-
-        if __event_emitter__:
-            await __event_emitter__(
-                {
-                    "type": "status",
-                    "data": {
-                        "description": "Checking response safety...",
-                        "done": False,
-                    },
-                }
-            )
-
-        if self.valves.enable_step_debug:
-            logger.info(
-                f"[SafetyGuard] Outlet: checking response ({len(assistant_msg)} chars)"
-            )
-
-        result = await self._check_safety(
-            user_message=user_msg,
-            agent_response=assistant_msg,
-            __user__=__user__,
-            __request__=__request__,
-        )
-
-        if __event_emitter__:
-            safe_str = (
-                "\u2713 Safe" if result.get("response_safe", True) else "\u26a0 Unsafe"
-            )
-            await __event_emitter__(
-                {
-                    "type": "status",
-                    "data": {
-                        "description": f"Safety check complete: {safe_str}",
-                        "done": True,
-                    },
-                }
-            )
-
-        # For outlet, check response safety specifically
-        is_unsafe = False
-        if result["response_safe"] is not None and not result["response_safe"]:
-            is_unsafe = True
-        elif not result["user_safe"]:
-            # If user was unsafe, the response might still be safe (refusal)
-            # Only block if response is also flagged
-            is_unsafe = (
-                result["response_safe"] is not None and not result["response_safe"]
-            )
-
-        if is_unsafe:
-            cats = (
-                ", ".join(result["categories"])
-                if result["categories"]
-                else "unspecified"
-            )
-            logger.warning(f"[SafetyGuard] BLOCKED outlet — categories: {cats}")
-
-            await self._log_violation(
-                "outlet", assistant_msg, result, __user__, __request__
-            )
-
-            if self.valves.block_on_unsafe:
-                # Replace the assistant's message with the safe message
-                for msg in reversed(messages):
-                    if msg.get("role") == "assistant":
-                        msg["content"] = (
-                            f"{self.valves.unsafe_message}\n\n"
-                            f"[Safety categories: {cats}]"
-                        )
-                        break
+                if self.valves.block_mode == "error":
+                    raise ValueError(f"Content blocked by safety filter: {cats}")
+                self._record_block(body, f"safety: {cats}")
+                return body
 
         return body
 

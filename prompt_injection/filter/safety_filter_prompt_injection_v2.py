@@ -1,12 +1,14 @@
 """
 Prompt Injection Protection Filter for Open WebUI
 Filters user inputs for prompt injection attempts using a dedicated detection model.
-version 2.0.0
+version: 2.1.0
 requirements: pydantic
+openwebui: 0.11.3 (verified 2026-09-12, image ghcr.io/open-webui/open-webui:main @ 0a7c158)
 """
 
 from typing import Optional, Callable, Awaitable, List, Any
 from pydantic import BaseModel, Field
+import asyncio
 import datetime
 import inspect
 import json
@@ -17,21 +19,34 @@ from urllib import request as urllib_request
 # Local Open WebUI imports (guarded for environments outside runtime)
 try:
     from open_webui.utils.chat import generate_chat_completion  # type: ignore
-    from open_webui.models.knowledge import Knowledges  # type: ignore
+    from open_webui.models.knowledge import Knowledges, KnowledgeForm  # type: ignore
     from open_webui.models.users import Users  # type: ignore
     from open_webui.routers.files import upload_file_handler  # type: ignore
     from open_webui.routers.retrieval import process_file, ProcessFileForm  # type: ignore
+    from open_webui.internal.db import AsyncSessionLocal  # type: ignore
     from fastapi import UploadFile  # type: ignore
     from fastapi.concurrency import run_in_threadpool  # type: ignore
 except ImportError:  # pragma: no cover - guarded optional runtime deps
     generate_chat_completion = None
     Knowledges = None
+    KnowledgeForm = None
+    AsyncSessionLocal = None
     Users = None
     upload_file_handler = None
     process_file = None
     ProcessFileForm = None
     UploadFile = None
     run_in_threadpool = None
+
+
+FILTER_BLOCK_AWARE = True  # this filter records blocks in the shared record and defers to later block-aware filters
+
+try:
+    from open_webui.utils.filter import resolve_filter_pipeline  # type: ignore
+    from open_webui.utils.plugin import get_function_module_from_cache  # type: ignore
+except ImportError:  # pragma: no cover
+    resolve_filter_pipeline = None
+    get_function_module_from_cache = None
 
 
 async def _call_openwebui(func, *args, **kwargs):
@@ -51,6 +66,9 @@ class Filter:
     Open WebUI Filter implementation for prompt injection protection.
     """
 
+    # Also on the class: Open WebUI's function cache hands back the Filter instance, not the module.
+    FILTER_BLOCK_AWARE = True
+
     class Valves(BaseModel):
         priority: int = -100
         enabled: bool = True
@@ -59,6 +77,14 @@ class Filter:
             description="Model ID for semantic prompt injection detection. The model's system prompt defines detection logic. Should return 'SAFE' or 'INJECTION' classification. Example: 'prompt-injection-detector'",
         )
         block_on_unsafe: bool = True
+        block_mode: str = Field(
+            default="message",
+            description="'message': show block_message as the reply and end the turn without calling the model, so the chat stays usable. 'error': raise an error on the message (old behaviour).",
+        )
+        block_message: str = Field(
+            default="⛔ This message was blocked by a safety filter and was not sent to the model. You can continue the conversation.",
+            description="Static text shown as the assistant reply when a prompt is blocked (block_mode='message').",
+        )
         enable_full_debug: bool = Field(
             default=False,
             description="Enable heavy debugging logs, including payloads/results (masked & truncated).",
@@ -131,6 +157,100 @@ class Filter:
     def _dbg_full(self, *parts: Any) -> None:
         if self._is_full_debug():
             self._print_safely(*parts)
+
+    async def _block_turn(self, __event_emitter__, body: Optional[dict] = None) -> None:
+        """Show the static block message plus every recorded reason as the reply and end the
+        turn without calling the model."""
+        record = ((body or {}).get("metadata") or {}).get("filter_block") or {}
+        reasons = [str(r) for r in record.get("reasons", []) if r]
+        text = self.valves.block_message
+        if reasons:
+            text += "\n\n" + "\n".join(f"- {r[:1].upper()}{r[1:]}" for r in reasons)
+        if __event_emitter__:
+            await __event_emitter__({"type": "replace", "data": {"content": text}})
+        raise asyncio.CancelledError("blocked by filter")
+
+    def _record_block(self, body: dict, reason: str) -> None:
+        """Record a violation in the shared block record (request metadata, never sent to the model).
+        The prompt is left untouched so later filters scan the same original text."""
+        meta = body.setdefault("metadata", {})
+        record = meta.setdefault("filter_block", {"reasons": []})
+        record.setdefault("reasons", []).append(reason)
+        self._dbg_step(f"Block recorded: {reason}")
+
+    async def _enforce_block_if_last(
+        self, body, __event_emitter__, __request__, __model__, __metadata__, __id__
+    ) -> None:
+        """If anything was recorded and no later block-aware filter will run, show the static
+        block message and end the turn. If the chain cannot be resolved, block immediately."""
+        record = (body.get("metadata") or {}).get("filter_block")
+        if not record or not record.get("reasons"):
+            return
+        try:
+            if not (resolve_filter_pipeline and get_function_module_from_cache and __request__ and __model__):
+                raise RuntimeError("filter chain helpers unavailable")
+            enabled_ids = (__metadata__ or body.get("metadata") or {}).get("filter_ids", []) or []
+            chain, _ = await resolve_filter_pipeline(__request__, __model__, enabled_ids)
+            later = chain[chain.index(__id__) + 1 :] if __id__ in chain else []
+            for fid in later:
+                module, _, _ = await get_function_module_from_cache(__request__, fid)
+                if getattr(module, "FILTER_BLOCK_AWARE", False):
+                    self._dbg_step(f"Block recorded; deferring final block to later filter '{fid}'")
+                    return
+        except Exception as e:
+            self._dbg_step(f"Could not resolve filter chain ({e}); blocking now")
+        await self._block_turn(__event_emitter__, body)
+
+    def _scrub_blocked_history(self, messages: list) -> list:
+        """Drop earlier blocked user messages and their block replies so blocked content never reaches the model as history."""
+        blocked = self.valves.block_message.strip()
+        out: list = []
+        for m in messages:
+            content = m.get("content", "")
+            if (
+                m.get("role") == "assistant"
+                and isinstance(content, str)
+                and content.strip().startswith(blocked)
+            ):
+                if out and out[-1].get("role") == "user":
+                    out.pop()
+                continue
+            out.append(m)
+        return out
+
+    def _safe_status_text(self, reason: str) -> str:
+        """Status line for the UI. A failed check must not read as a pass."""
+        if reason:
+            return f"Prompt injection check FAILED (not enforced): {reason}"
+        return "Prompt injection check complete: ✓ Safe"
+
+    async def _get_or_create_kb(self, kb_name: str, user_id: str) -> Optional[str]:
+        """Return the id of the knowledge base named kb_name, creating it if missing.
+        the per-user knowledge lookup was removed from Open WebUI; list all and match by id or name."""
+        if not Knowledges or not kb_name:
+            return None
+        try:
+            for kb in await _call_openwebui(Knowledges.get_knowledge_bases):
+                if kb.id == kb_name or kb.name == kb_name:
+                    return kb.id
+            if not user_id or not KnowledgeForm:
+                self._dbg_step(f"Cannot create KB '{kb_name}': no user id or KnowledgeForm")
+                return None
+            created = await _call_openwebui(
+                Knowledges.insert_new_knowledge,
+                user_id,
+                KnowledgeForm(
+                    name=kb_name,
+                    description="Auto-created by Prompt Injection Protection Filter for violation logging",
+                ),
+            )
+            if created:
+                self._dbg_step(f"Created KB '{kb_name}' ({created.id})")
+                return created.id
+            self._dbg_step(f"Failed to create KB '{kb_name}'")
+        except Exception as e:
+            self._dbg_step(f"KB lookup/create error for '{kb_name}': {e}")
+        return None
 
     async def _disable_user(self, user_id: str) -> bool:
         """
@@ -256,6 +376,27 @@ class Filter:
         __user__: Optional[dict] = None,
         __event_emitter__: Optional[Callable[[dict], Awaitable[None]]] = None,
         __request__: Optional[Any] = None,
+        __model__: Optional[dict] = None,
+        __metadata__: Optional[dict] = None,
+        __id__: Optional[str] = None,
+    ) -> dict:
+        body = await self._inlet_impl(
+            body,
+            __user__=__user__,
+            __event_emitter__=__event_emitter__,
+            __request__=__request__,
+        )
+        await self._enforce_block_if_last(
+            body, __event_emitter__, __request__, __model__, __metadata__, __id__
+        )
+        return body
+
+    async def _inlet_impl(
+        self,
+        body: dict,
+        __user__: Optional[dict] = None,
+        __event_emitter__: Optional[Callable[[dict], Awaitable[None]]] = None,
+        __request__: Optional[Any] = None,
     ) -> dict:
         """
         Filter incoming user messages for prompt injection attempts.
@@ -269,7 +410,8 @@ class Filter:
         self.__request__ = __request__
         self.__user__ = __user__
 
-        messages = body.get("messages", [])
+        messages = self._scrub_blocked_history(body.get("messages", []))
+        body["messages"] = messages
         if not messages:
             self._dbg_step("Inlet skipped: No messages")
             return body
@@ -330,7 +472,10 @@ class Filter:
                             },
                         }
                     )
-                raise ValueError(f"Content blocked - prompt injection detected: {injection_reason}")
+                if self.valves.block_mode == "error":
+                    raise ValueError(f"Content blocked - prompt injection detected: {injection_reason}")
+                self._record_block(body, f"prompt injection: {injection_reason}")
+                return body
 
             if __event_emitter__:
                 self._dbg_step("Emitting status: Prompt injection check complete")
@@ -338,7 +483,7 @@ class Filter:
                     {
                         "type": "status",
                         "data": {
-                            "description": "Prompt injection check complete: ✓ Safe",
+                            "description": self._safe_status_text(injection_reason),
                             "done": True,
                         },
                     }
@@ -373,7 +518,7 @@ class Filter:
             self._dbg_step("Violation KB logging disabled (violation_kb not set)")
             return
 
-        if not all([upload_file_handler, process_file, Knowledges, Users, run_in_threadpool]):
+        if not all([upload_file_handler, process_file, Knowledges, Users, AsyncSessionLocal]):
             self._dbg_step("Required OpenWebUI modules not available for KB logging")
             return
 
@@ -392,16 +537,10 @@ class Filter:
             kb_name = self.valves.violation_kb.strip()
             kb_id = None
             
-            # Try to find by ID or Name
-            kbs = await _call_openwebui(Knowledges.get_knowledge_bases_by_user_id, user_obj.id, "write")
-            if kbs:
-                for kb in kbs:
-                    if kb.id == kb_name or kb.name == kb_name:
-                        kb_id = kb.id
-                        break
-            
+            # Find by id or name, creating it if missing
+            kb_id = await self._get_or_create_kb(kb_name, user_obj.id)
             if not kb_id:
-                self._dbg_step(f"Violation KB '{kb_name}' not found for user")
+                self._dbg_step(f"Violation KB '{kb_name}' not found and could not be created")
                 return
 
             # Prepare content
@@ -471,13 +610,15 @@ class Filter:
                         data["file_ids"] = file_ids
                         await _call_openwebui(Knowledges.update_knowledge_data_by_id, id=kb_id, data=data)
 
-            # Process File
-            await _call_openwebui(
-                process_file,
-                request,
-                ProcessFileForm(file_id=file_id, collection_name=kb_id, content=full_log_content),
-                user_obj,
-            )
+            # Process (index) the file. process_file needs an explicit session now that
+            # FastAPI's Depends is not injecting one for direct calls.
+            async with AsyncSessionLocal() as db:
+                await process_file(
+                    request,
+                    ProcessFileForm(file_id=file_id, collection_name=kb_id, content=full_log_content),
+                    user_obj,
+                    db=db,
+                )
             
             self._dbg_step(f"Violation logged to KB '{kb_name}' (File ID: {file_id})")
 
@@ -498,7 +639,7 @@ class Filter:
         # Check if model ID is configured
         if not self.valves.injection_detection_model_id:
             self._dbg_step("No injection detection model ID configured; skipping detection as safe")
-            return True, ""
+            return True, "check failed: no injection_detection_model_id configured"
         
         try:
             # Import internal Open WebUI function for generating chat completions
@@ -530,13 +671,13 @@ class Filter:
                 choices = response.get("choices", [])
                 if not choices or not isinstance(choices, list) or not choices:
                     self._dbg_step("No 'choices' array in model response")
-                    return True, ""
+                    return True, "check failed: empty model response"
                 
                 message = choices[0].get("message", {})
                 response_text = message.get("content", "")
             else:
                 self._dbg_step(f"Unexpected response type: {type(response)}")
-                return True, ""
+                return True, f"check failed: unexpected response type {type(response).__name__}"
             
             self._dbg_step(f"Injection detection response: {response_text}")
             
@@ -558,11 +699,11 @@ class Filter:
                         reason = reason_part
                 return False, reason
             
-            # Any other output: fail-open
-            return True, ""
+            # Any other output: fail-open, but report it
+            return True, f"check failed: unrecognized model output: {response_str[:80]}"
             
         except Exception as e:
             self._dbg_step(f"Injection detection exception: {e}")
-            # Fail-open: do not block on unexpected exceptions
-            return True, ""
+            # Fail-open: do not block on unexpected exceptions, but report it
+            return True, f"check failed: {e}"
 

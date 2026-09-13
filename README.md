@@ -15,7 +15,7 @@ A comprehensive collection of content filtering and safety modules for Open WebU
 
 ## Overview
 
-This repository contains multiple safety filter implementations designed to protect Open WebUI deployments by scanning user inputs and model outputs for various threats and policy violations. All filters follow the Open WebUI Filter interface specification.
+This repository contains multiple safety filter implementations designed to protect Open WebUI deployments by scanning user inputs for various threats and policy violations. All filters are input-only: a blocked prompt never reaches the model, and the user sees one aggregated block reply instead of an error. All filters follow the Open WebUI Filter interface specification.
 
 Shared Open WebUI extension patterns used by these filters are documented in [docs/openwebui-internal-library-patterns.md](docs/openwebui-internal-library-patterns.md).
 
@@ -26,8 +26,8 @@ Shared Open WebUI extension patterns used by these filters are documented in [do
    - Integrates with ClamAV daemon for real-time threat detection
    - Automatically blocks infected files and logs violations
 
-2. **Content Safety Filter** (`content_safety/filter/safety_guard_filter_v3.py`)
-   - Filters user inputs and model outputs for harmful content
+2. **Content Safety Filter** (`content_safety/filter/safety_guard_filter_v3_latest.py`)
+   - Filters user inputs for harmful content
     - Uses an internal Open WebUI safety model for content classification
     - Detects a configurable 23-category safety taxonomy
    - Advanced safety filtering with policy augmentation
@@ -36,7 +36,7 @@ Shared Open WebUI extension patterns used by these filters are documented in [do
    - Includes comprehensive logging and debugging capabilities
 
 3. **Policy Violation Filter** (`policy_violation/filter/safety_filter_company_policy_violation_v1.py`)
-   - Detects potential company policy violations in user input and model output
+   - Detects potential company policy violations in user input
    - Uses Open WebUI's internal chat system and vector database
    - Customizable policy rules and violation detection thresholds
    - Tracks violation history per user
@@ -50,11 +50,25 @@ Shared Open WebUI extension patterns used by these filters are documented in [do
 
 ## Open WebUI Compatibility
 
-These filters target the current Open WebUI filter-function interface and are verified against Open WebUI 0.9.5.
+These filters are verified against **Open WebUI 0.11.3** (image `ghcr.io/open-webui/open-webui:main`, commit `0a7c158`, 2026-09-12). Each filter file carries an `openwebui:` line in its header stating the version it was last verified against.
 
-The retained filters use `async def inlet(...)` and `async def outlet(...)`, which Open WebUI 0.9.x awaits directly. Internal Open WebUI calls are made through a small compatibility helper that supports both async 0.9.x APIs and older synchronous APIs, so the same filter files should remain compatible with earlier Open WebUI releases that expose the same module and method names.
+| Filter | File | Filter version | Verified against |
+|---|---|---|---|
+| Antivirus/Antimalware | `antivirus/filter/safety_filter_antivirus_antimalware.py` | 1.1.0 | Open WebUI 0.11.3 |
+| Content Safety (Safety Guard v3) | `content_safety/filter/safety_guard_filter_v3_latest.py` | 3.1.0 | Open WebUI 0.11.3 |
+| Policy Violation | `policy_violation/filter/safety_filter_company_policy_violation_v1.py` | 1.1.0 | Open WebUI 0.11.3 |
+| Prompt Injection | `prompt_injection/filter/safety_filter_prompt_injection_v2.py` | 2.1.0 | Open WebUI 0.11.3 |
 
-Known compatibility boundary: Open WebUI changed many model, knowledge, file, and router helpers to async in the 0.9.x series. If you run an older Open WebUI release whose helper names or signatures differ, the filters may need a small adapter update. Prefer using the current single filter implementation per family instead of restoring older versioned copies.
+Open WebUI changes its internal helpers often, and filters fail open silently when a helper disappears. The filters depend on these internals as of 0.11.3; if an update changes any of them, expect the status line under a message to read `FAILED (not enforced)` rather than a pass:
+
+- `Users`, `Files`, `Knowledges` and `Functions` model methods are all `async` and are awaited directly.
+- `Knowledges.get_knowledge_bases_by_user_id` no longer exists. Filters list all knowledge bases with `Knowledges.get_knowledge_bases()` and match by id or name, creating the base with `insert_new_knowledge` when missing.
+- A direct call to `routers.retrieval.process_file` needs an explicit session: `async with AsyncSessionLocal() as db: await process_file(..., db=db)`. Calling it without one fails with `'Depends' object has no attribute 'commit'`.
+- `routers.files.upload_file_handler` links and indexes a file itself when the metadata carries `knowledge_id` and `process=True`.
+- The fall-through block pattern resolves the filter chain with `utils.filter.resolve_filter_pipeline` and inspects later filters through `utils.plugin.get_function_module_from_cache`, which returns the `Filter` **instance**, not the module.
+- A filter ends a turn without calling the model by emitting a `replace` event with the reply text and raising `asyncio.CancelledError`; Open WebUI treats that as a cancelled turn, not an error, so the chat stays usable. An error with no content would trigger the "error in the previous response" toast and block further input.
+
+**After every Open WebUI update**, send one prompt that trips more than one filter (for example a harassment request combined with an override attempt and an EICAR attachment). Expect one block reply listing every filter that fired. That single check exercises the chain resolver, the cache marker, the `replace` event and the cancel path.
 
 ### Prerequisites
 
@@ -95,7 +109,11 @@ Each filter uses a `Valves` configuration class with the following common settin
 class Valves(BaseModel):
     priority: int = 0              # Execution priority (-200 to 100)
     enabled: bool = True           # Enable/disable filter
+    block_mode: str = "message"    # "message": static reply, no model call (default); "error": raise (old behaviour)
+    block_message: str = "⛔ This message was blocked by a safety filter and was not sent to the model. You can continue the conversation."
 ```
+
+`block_mode="message"` is the tested default. Keep `block_message` identical across filters; whichever filter runs last shows it, followed by one bullet per filter that fired. The Content Safety filter has no `enabled` valve.
 
 ### Antivirus/Antimalware Filter
 
@@ -106,7 +124,10 @@ scan_attached_files: bool = True
     # Enable scanning of files attached to messages
 
 clamav_url: str = "http://localhost:3310"
-    # ClamAV daemon endpoint URL
+    # ClamAV daemon endpoint URL. Inside the Open WebUI container "localhost" is not ClamAV:
+    # use http://host.docker.internal:3310 (published port) or http://clamav:3310 when both
+    # containers share a Docker network. Files are streamed to ClamAV (INSTREAM), so ClamAV
+    # never needs access to Open WebUI's uploads directory.
 
 clamav_timeout: float = 30.0
     # Scan timeout in seconds
@@ -143,16 +164,16 @@ enable_step_debug: bool = False
 
 ```python
 safety_model_id: str = "safety-guard-qwen3-14b"
-    # Open WebUI model ID for the safety classifier
-
-check_input: bool = True
-    # Check user input messages
-
-check_output: bool = True
-    # Check model output responses
+    # Open WebUI model ID for the safety classifier. The filter builds the full
+    # Nemotron-style classification prompt itself, so this can be a workspace model on
+    # your base model with the minimal JSON-only system prompt in
+    # content_safety/prompt/safety_filter_guard_v3.md (or the trained LoRA when served).
 
 block_on_unsafe: bool = True
     # Block unsafe content
+
+violation_kb: str = ""
+    # Knowledge base for logging violations (empty disables logging)
 
 harm_categories: List[str]
     # Use S1_* through S23_* valves to enable/disable categories
@@ -169,11 +190,11 @@ policy_model_id: str = "prompt-safety-and-policy-violation-detector"
 block_on_unsafe: bool = True
     # Block policy violations
 
-check_input: bool = True
-    # Check user input
+compliance_kb: str = "Company Policies"
+    # Comma-separated knowledge base name(s) whose documents are added to the check prompt
 
-check_output: bool = True
-    # Check model output
+violation_kb: str = "Company Policy Violations"
+    # Knowledge base for logging violations (created if missing)
 
 enable_full_debug: bool = False
     # Detailed debugging logs
@@ -189,6 +210,9 @@ injection_detection_model_id: str = ""
 
 block_on_unsafe: bool = True
     # Block detected injections
+
+violation_kb: str = "Prompt Injection Violations"
+    # Knowledge base for logging violations (created if missing)
 
 enable_full_debug: bool = False
     # Detailed debugging logs
@@ -259,18 +283,27 @@ class Filter:
     async def inlet(self, body: dict, **kwargs) -> dict:
         """Process incoming user messages"""
         pass
-    
-    async def outlet(self, body: dict, **kwargs) -> dict:
-        """Process outgoing model responses"""
-        pass
 ```
+
+All filters are input-only. Output (outlet) checks were removed on purpose: the outlet runs after the response has already streamed to the user, so replacing it afterwards is a leak with a cosmetic patch. Output screening, if added, belongs in a separate `stream`-hook filter with its own rules.
 
 ### Execution Flow
 
-1. **Inlet Phase**: User message enters → Filter checks input → Decision to allow/block
-2. **Outlet Phase**: Model response ready → Filter checks output → Decision to allow/block
-3. **Violation Logging**: Detected violations logged to knowledge base
+1. **Inlet Phase**: User message enters → each filter checks the original input in priority order
+2. **Violation Logging**: Every filter that detects something logs to its own knowledge base and applies its lockout counter
+3. **Block**: The last block-aware filter in the chain shows the aggregated block reply and ends the turn; the model is never called
 4. **User Status**: User may be flagged for review based on violation count
+
+### Block Pattern (shared by all filters)
+
+Every filter carries `FILTER_BLOCK_AWARE = True` on its `Filter` class and the same small set of helpers:
+
+- On a detection the filter does its own logging and lockout, then `_record_block(body, reason)` appends the reason to `body["metadata"]["filter_block"]` (request metadata is never sent to the model) and returns the prompt **untouched**, so later filters still scan the same text.
+- After every inlet run, `_enforce_block_if_last` asks Open WebUI's chain resolver whether any later block-aware filter will run. If so it defers; if not, and something was recorded, `_block_turn` emits the static `block_message` plus one bullet per reason and cancels the turn. If the chain cannot be resolved it blocks immediately (fails closed).
+- `_scrub_blocked_history` drops earlier blocked prompts and their block replies from the history before the model sees it.
+- Fail-open paths (detector unreachable, empty or unparseable verdict, missing library) return a `check failed: ...` reason, and the status line reads `FAILED (not enforced)` instead of a pass.
+
+Adding a new filter: copy the helper block, call `_record_block` instead of raising, and wrap `inlet` so it ends with `_enforce_block_if_last`. Nothing else needs to know about the other filters.
 
 ### Priority System
 
@@ -279,7 +312,8 @@ class Filter:
 - Default priorities:
   - Antivirus: -200 (highest priority)
   - Prompt Injection: -100
-  - Other filters: 0
+  - Content Safety: -1
+  - Policy Violation: 0 (last block-aware filter by default, so it shows the aggregated block reply)
 
 ## API Integrations
 

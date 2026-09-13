@@ -1,13 +1,15 @@
 """
 Policy Violation Filter for Open WebUI
-Filters user inputs and model outputs for potential company policy violations using local Open WebUI libraries (internal chat + vector DB) with optional policy augmentation.
+Filters user inputs for potential company policy violations using local Open WebUI libraries (internal chat + vector DB) with optional policy augmentation.
 All remote HTTP API usage removed; only explicit policy violation detection remains.
-version 1.0.0
+version: 1.1.0
 requirements: pydantic
+openwebui: 0.11.3 (verified 2026-09-12, image ghcr.io/open-webui/open-webui:main @ 0a7c158)
 """
 
 from typing import Optional, Callable, Awaitable, List, Any
 from pydantic import BaseModel, Field
+import asyncio
 import json
 import unicodedata
 import datetime  # For datetime logging
@@ -71,10 +73,23 @@ async def _call_openwebui(func, *args, **kwargs):
     return result
 
 
+FILTER_BLOCK_AWARE = True  # this filter records blocks in the shared record and defers to later block-aware filters
+
+try:
+    from open_webui.utils.filter import resolve_filter_pipeline  # type: ignore
+    from open_webui.utils.plugin import get_function_module_from_cache  # type: ignore
+except ImportError:  # pragma: no cover
+    resolve_filter_pipeline = None
+    get_function_module_from_cache = None
+
+
 class Filter:
     """
     Open WebUI Filter implementation for content Policy Violation.
     """
+
+    # Also on the class: Open WebUI's function cache hands back the Filter instance, not the module.
+    FILTER_BLOCK_AWARE = True
 
     class Valves(BaseModel):
         priority: int = 0
@@ -84,8 +99,14 @@ class Filter:
             description="Direct model ID for policy violation classification (internal).",
         )
         block_on_unsafe: bool = True
-        check_input: bool = True
-        check_output: bool = True
+        block_mode: str = Field(
+            default="message",
+            description="'message': show block_message as the reply and end the turn without calling the model, so the chat stays usable. 'error': raise an error on the message (old behaviour).",
+        )
+        block_message: str = Field(
+            default="⛔ This message was blocked by a safety filter and was not sent to the model. You can continue the conversation.",
+            description="Static text shown as the assistant reply when a prompt is blocked (block_mode='message').",
+        )
         enable_full_debug: bool = Field(
             default=False,
             description="Enable heavy debugging logs, including payloads/results (masked & truncated).",
@@ -147,6 +168,74 @@ class Filter:
         if self._is_full_debug():
             self._print_safely(*parts)
 
+    async def _block_turn(self, __event_emitter__, body: Optional[dict] = None) -> None:
+        """Show the static block message plus every recorded reason as the reply and end the
+        turn without calling the model."""
+        record = ((body or {}).get("metadata") or {}).get("filter_block") or {}
+        reasons = [str(r) for r in record.get("reasons", []) if r]
+        text = self.valves.block_message
+        if reasons:
+            text += "\n\n" + "\n".join(f"- {r[:1].upper()}{r[1:]}" for r in reasons)
+        if __event_emitter__:
+            await __event_emitter__({"type": "replace", "data": {"content": text}})
+        raise asyncio.CancelledError("blocked by filter")
+
+    def _record_block(self, body: dict, reason: str) -> None:
+        """Record a violation in the shared block record (request metadata, never sent to the model).
+        The prompt is left untouched so later filters scan the same original text."""
+        meta = body.setdefault("metadata", {})
+        record = meta.setdefault("filter_block", {"reasons": []})
+        record.setdefault("reasons", []).append(reason)
+        self._dbg_step(f"Block recorded: {reason}")
+
+    async def _enforce_block_if_last(
+        self, body, __event_emitter__, __request__, __model__, __metadata__, __id__
+    ) -> None:
+        """If anything was recorded and no later block-aware filter will run, show the static
+        block message and end the turn. If the chain cannot be resolved, block immediately."""
+        record = (body.get("metadata") or {}).get("filter_block")
+        if not record or not record.get("reasons"):
+            return
+        try:
+            if not (resolve_filter_pipeline and get_function_module_from_cache and __request__ and __model__):
+                raise RuntimeError("filter chain helpers unavailable")
+            enabled_ids = (__metadata__ or body.get("metadata") or {}).get("filter_ids", []) or []
+            chain, _ = await resolve_filter_pipeline(__request__, __model__, enabled_ids)
+            later = chain[chain.index(__id__) + 1 :] if __id__ in chain else []
+            for fid in later:
+                module, _, _ = await get_function_module_from_cache(__request__, fid)
+                if getattr(module, "FILTER_BLOCK_AWARE", False):
+                    self._dbg_step(f"Block recorded; deferring final block to later filter '{fid}'")
+                    return
+        except Exception as e:
+            self._dbg_step(f"Could not resolve filter chain ({e}); blocking now")
+        await self._block_turn(__event_emitter__, body)
+
+    def _scrub_blocked_history(self, messages: list) -> list:
+        """Drop earlier blocked user messages and their block replies so blocked content never reaches the model as history."""
+        blocked = self.valves.block_message.strip()
+        out: list = []
+        for m in messages:
+            content = m.get("content", "")
+            if (
+                m.get("role") == "assistant"
+                and isinstance(content, str)
+                and content.strip().startswith(blocked)
+            ):
+                if out and out[-1].get("role") == "user":
+                    out.pop()
+                continue
+            out.append(m)
+        return out
+
+    def _status_text(self, is_violation: bool, reason: str) -> str:
+        """Status line for the UI. A failed check must not read as a pass."""
+        if is_violation:
+            return f"Policy check complete: ⚠ {reason} detected"
+        if reason:
+            return f"Policy check FAILED (not enforced): {reason}"
+        return "Policy check complete: ✓ No violation"
+
     async def _generate_policy_completion(
         self,
         request: Optional[Any],
@@ -189,10 +278,11 @@ class Filter:
             self._dbg_step("Knowledge modules unavailable")
             return None
 
-        kbs = await _call_openwebui(Knowledges.get_knowledge_bases_by_user_id, user_id, "write")
+        # the per-user knowledge lookup was removed from Open WebUI; list all and match by id or name
+        kbs = await _call_openwebui(Knowledges.get_knowledge_bases)
         if kbs:
             for kb in kbs:
-                if kb.name == kb_name:
+                if kb.id == kb_name or kb.name == kb_name:
                     return kb.id
 
         knowledge_form = KnowledgeForm(
@@ -217,16 +307,38 @@ class Filter:
         __user__: Optional[dict] = None,
         __event_emitter__: Optional[Callable[[dict], Awaitable[None]]] = None,
         __request__: Optional[Any] = None,
+        __model__: Optional[dict] = None,
+        __metadata__: Optional[dict] = None,
+        __id__: Optional[str] = None,
+    ) -> dict:
+        body = await self._inlet_impl(
+            body,
+            __user__=__user__,
+            __event_emitter__=__event_emitter__,
+            __request__=__request__,
+        )
+        await self._enforce_block_if_last(
+            body, __event_emitter__, __request__, __model__, __metadata__, __id__
+        )
+        return body
+
+    async def _inlet_impl(
+        self,
+        body: dict,
+        __user__: Optional[dict] = None,
+        __event_emitter__: Optional[Callable[[dict], Awaitable[None]]] = None,
+        __request__: Optional[Any] = None,
     ) -> dict:
         """
         Filter incoming user messages for company policy violations.
         """
         self._dbg_full("Inlet called with body:", body)  # heavy: full body
-        if not self.valves.enabled or not self.valves.check_input:
-            self._dbg_step("Inlet skipped: Disabled or no check_input")  # Log skip
+        if not self.valves.enabled:
+            self._dbg_step("Inlet skipped: Disabled")  # Log skip
             return body
 
-        messages = body.get("messages", [])
+        messages = self._scrub_blocked_history(body.get("messages", []))
+        body["messages"] = messages
         if not messages:
             self._dbg_step("Inlet skipped: No messages")  # Log skip
             return body
@@ -258,7 +370,7 @@ class Filter:
                     {
                         "type": "status",
                         "data": {
-                            "description": f"Policy check complete: {'✓ No violation' if not is_violation else f'⚠ {reason} detected'}",
+                            "description": self._status_text(is_violation, reason),
                             "done": True,
                         },
                     }
@@ -279,86 +391,10 @@ class Filter:
                             },
                         }
                     )
-                raise ValueError(f"Content blocked due to policy violation: {reason}")
-
-        return body
-
-    async def outlet(
-        self,
-        body: dict,
-        __user__: Optional[dict] = None,
-        __event_emitter__: Optional[Callable[[dict], Awaitable[None]]] = None,
-        __request__: Optional[Any] = None,
-    ) -> dict:
-        """
-        Filter outgoing model responses for company policy violations.
-        """
-        self._dbg_full("Outlet called with body:", body)  # heavy: full body
-        if not self.valves.enabled or not self.valves.check_output:
-            self._dbg_step("Outlet skipped: Disabled or no check_output")  # Log skip
-            return body
-
-        messages = body.get("messages", [])
-        if not messages:
-            self._dbg_step("Outlet skipped: No messages")  # Log skip
-            return body
-
-        # Check the last assistant message
-        last_message = messages[-1]
-        if last_message.get("role") == "assistant":
-            assistant_content = last_message.get("content", "")
-            self._dbg_step("Checking assistant content:", self._truncate(assistant_content, 100))
-
-            if __event_emitter__:
-                self._dbg_step("Emitting status: Checking response for policy violations...")  # Log emit
-                await __event_emitter__(
-                    {
-                        "type": "status",
-                        "data": {
-                            "description": "Checking response Policy Violation...",
-                            "done": False,
-                        },
-                    }
-                )
-
-            is_violation, reason = await self.check_policy_violation(assistant_content, __user__, __request__, check_response=True)
-            self._dbg_step(f"Policy violation check result: is_violation={is_violation} reason={reason}")
-
-            if __event_emitter__:
-                self._dbg_step("Emitting status: Policy violation check complete")  # Log emit
-                await __event_emitter__(
-                    {
-                        "type": "status",
-                        "data": {
-                            "description": f"Policy check complete: {'✓ No violation' if not is_violation else f'⚠ {reason} detected'}",
-                            "done": True,
-                        },
-                    }
-                )
-
-            if is_violation and self.valves.block_on_unsafe:
-                await self.log_violation(
-                    __user__, assistant_content, reason, __request__
-                )  # Log to KB
-                self._dbg_step(f"Blocking output content due to policy violation: {reason}")
-                self._dbg_full("Blocking output content payload:", assistant_content)
-                if __event_emitter__:
-                    self._dbg_step("Emitting status: Response blocked by policy violation filter")  # Log emit
-                    await __event_emitter__(
-                        {
-                            "type": "status",
-                            "data": {
-                                "description": "Response blocked: policy violation",
-                                "done": True,
-                            },
-                        }
-                    )
-
-                # Replace unsafe content with safe message
-                last_message["content"] = (
-                    "I cannot provide that response because it appears to violate company policy "
-                    f"({reason}). Please rephrase your request."
-                )
+                if self.valves.block_mode == "error":
+                    raise ValueError(f"Content blocked due to policy violation: {reason}")
+                self._record_block(body, f"policy violation: {reason}")
+                return body
 
         return body
 
@@ -534,7 +570,7 @@ class Filter:
             # Invoke local model (internal library)
             if not generate_chat_completion:
                 self._dbg_step("generate_chat_completion unavailable; treating as no violation")
-                return False, ""
+                return False, "check failed: generate_chat_completion unavailable"
             payload = {
                 "model": self.valves.policy_model_id,
                 "messages": [{"role": "user", "content": prompt}],
@@ -543,9 +579,9 @@ class Filter:
             self._dbg_full("Local policy violation payload:", payload)
             try:
                 response = await self._generate_policy_completion(__request__, payload, user)
-            except (RuntimeError, ValueError) as e:
+            except Exception as e:
                 self._dbg_step(f"Model invocation error: {e}; no violation")
-                return False, ""
+                return False, f"check failed: model error: {e}"
             if isinstance(response, dict):
                 choices = response.get("choices", [])
                 if choices and isinstance(choices, list):
@@ -553,16 +589,16 @@ class Filter:
                     response_text = message.get("content", "")
                 else:
                     self._dbg_step("Empty choices; no violation")
-                    return False, ""
+                    return False, "check failed: empty model response"
             else:
                 self._dbg_step(f"Unexpected response type {type(response)}; no violation")
-                return False, ""
+                return False, f"check failed: unexpected response type {type(response).__name__}"
             self._dbg_step("Policy model text response:", self._truncate(response_text, 200))
             return self._parse_violation_response(response_text, check_response=check_response)
 
-        except (RuntimeError, ValueError, TypeError) as e:
+        except Exception as e:
             self._dbg_step(f"Policy violation check exception: {e}")
-            return False, ""  # Fail-open -> no violation
+            return False, f"check failed: {e}"  # Fail-open -> no violation, but reported
 
     def _parse_violation_response(self, response_text: str, check_response: bool = False) -> tuple[bool, str]:
         """
@@ -571,7 +607,7 @@ class Filter:
         self._dbg_step("Parsing policy violation response:", self._truncate(response_text, 200))  # Log entry
         if not response_text:
             self._dbg_step("Empty policy response - defaulting to no violation")  # Log empty response
-            return False, ""
+            return False, "check failed: empty model response"
 
         cleaned = response_text.strip()
         if cleaned.startswith("```"):
@@ -583,7 +619,7 @@ class Filter:
             parsed = json.loads(cleaned)
         except (json.JSONDecodeError, TypeError) as e:
             self._dbg_step(f"Invalid policy JSON response: {e}")
-            return False, ""
+            return False, f"check failed: invalid JSON from model: {e}"
 
         safety_key = "Response Safety" if check_response else "User Safety"
         safety_value = str(parsed.get(safety_key, "")).strip().lower()
