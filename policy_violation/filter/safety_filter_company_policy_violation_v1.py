@@ -41,6 +41,35 @@ S21: Unauthorized Advice.
 S22: Illegal Activity.
 S23: Immoral/Unethical."""
 
+# Exact code -> name lookup built from the taxonomy above (e.g. "S22" -> "Illegal Activity").
+TAXONOMY_BY_CODE = {
+    line.split(":", 1)[0].strip(): line.split(":", 1)[1].strip().rstrip(".")
+    for line in SAFETY_TAXONOMY.splitlines()
+    if ":" in line
+}
+
+
+def categories_to_names(categories: str) -> str:
+    """Map the classifier's comma-separated categories to taxonomy names.
+
+    Accepts codes ("S22"), code-prefixed labels ("S22: Illegal Activity") or bare names.
+    Uses exact code matching so "S22" never resolves to "S2". Unknown entries are dropped,
+    duplicates removed, order preserved. Returns all applicable names joined by ", ".
+    """
+    names_set = set(TAXONOMY_BY_CODE.values())
+    names = []
+    for raw in str(categories or "").split(","):
+        item = raw.strip().rstrip(".")
+        if not item:
+            continue
+        code = item.split(":", 1)[0].strip()
+        name = TAXONOMY_BY_CODE.get(code)
+        if name is None and item in names_set:
+            name = item
+        if name and name not in names:
+            names.append(name)
+    return ", ".join(names)
+
 # Local Open WebUI imports (guarded for environments outside runtime)
 try:
     from open_webui.utils.chat import generate_chat_completion  # type: ignore
@@ -628,7 +657,7 @@ class Filter:
             return False, ""
 
         categories = str(parsed.get("Safety Categories", "")).strip()
-        reason = categories or "Policy Violation"
+        reason = categories_to_names(categories) or categories or "Policy Violation"
         self._dbg_step(f"Unsafe content detected: {reason}")
         return True, reason
 

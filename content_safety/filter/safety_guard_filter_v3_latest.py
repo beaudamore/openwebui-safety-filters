@@ -431,7 +431,7 @@ class Filter:
             else:
                 # Try matching by code prefix (e.g., "S7" in "S7: Sexual (minor)")
                 for code, name in enabled.items():
-                    if cat.startswith(code) or name.startswith(cat):
+                    if cat == code or cat.split(":")[0].strip() == code or name == cat:
                         filtered.append(name)
                         break
         return filtered
